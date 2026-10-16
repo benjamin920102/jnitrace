@@ -1,3 +1,7 @@
+> **Reconstruction tracing source update / 還原追蹤原始碼更新**
+> schema 2, capability limits, and operation conversion. 本次依要求未編譯或測試，沒有還原 JAR 輸出功能。
+> Object results are now structured objects with stable IDs and optional text.
+
 # jnitrace：JNI 呼叫追蹤器
 
 原始碼包含 Windows x64 / Linux x64 建置流程，使用 GitHub Actions 的 JDK 21 編譯。

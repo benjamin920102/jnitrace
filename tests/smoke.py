@@ -32,18 +32,18 @@ with tempfile.TemporaryDirectory() as tmp:
         assert raw, "No trace produced (check native initialization stderr)"
         enters = {x["seq"]: x for x in records if x["ev"] == "enter"}
         exits = {x["seq"]: x for x in records if x["ev"] == "exit"}
-        assert len(enters) == 3200, len(enters)
+        assert len(enters) == 5600, len(enters)
         assert enters.keys() == exits.keys()
-        assert len(records) == 2 * len(enters)
+        assert all(x.get("schema") == 2 for x in enters.values())
         assert len({x["tid"] for x in enters.values()}) == 2
         assert all(x["in"].startswith("obf.Fixture.") for x in enters.values())
-        assert any(x.get("val") == "A\x00中😀" for x in exits.values())
+        assert any(isinstance(x.get("val"), dict) and x["val"].get("text") == "A\x00中😀" for x in exits.values())
         assert sum(bool(x.get("exception")) for x in exits.values()) == 400
         assert not (out / "jni_trace.json").exists()
         assert any(x.get("ev") == "context" for x in raw) == bool(compact)
-    # Filter rejection should create an empty trace.
+    # Filter rejection should produce no JNI operations (session metadata remains).
     out = pathlib.Path(tmp) / "reject"
     subprocess.run(["java", f"-javaagent:{jar}=module=fixture,include=does.not.match.*,out={out}", "-cp", str(root / "target/test-classes"), "obf.Fixture", str(lib)], check=True)
-    assert (out / "jni_trace.jsonl").read_bytes() == b""
+    assert not any(x.get("ev") == "enter" for x in map(json.loads, (out / "jni_trace.jsonl").read_text().splitlines()))
 assert sizes[1] < sizes[0], sizes
 print(f"Smoke passed; plain={sizes[0]} compact={sizes[1]} bytes")

@@ -42,6 +42,19 @@ static std::string        g_filter;      // lower-case substring of module name;
 static std::string        g_dumpdir;     // DefineClass dump dir (optional)
 static bool               g_unknown = false;
 static std::vector<std::string> g_classpat;  // glob patterns on dotted class name; empty = no class filter
+static bool g_tags = false, g_boundaries = false;
+static thread_local bool g_callback = false;
+static thread_local std::vector<long long> g_jni_stack;
+struct NativeFrame { jmethodID method; long long id; bool selected; };
+static thread_local std::vector<NativeFrame> g_native_stack;
+static long long current_native_id() {
+    for (auto it = g_native_stack.rbegin(); it != g_native_stack.rend(); ++it)
+        if (it->selected) return it->id;
+    return 0;
+}
+static std::mutex g_tagmu;
+static std::atomic<long long> g_object_seq{0}, g_frame_seq{0};
+static std::string object_value(JNIEnv*, jobject, bool = false);
 static int                g_depth = 1;       // how many Java frames (from top) to test against g_classpat // log calls whose caller module is unknown
 
 struct ModInfo { bool match; std::string name; };
@@ -177,17 +190,22 @@ struct J {
     long long seq = 0;
     JNIEnv* env;
     J(JNIEnv* e, const char* fn, void* ra) : env(e) {
-        if (!g_active.load(std::memory_order_acquire)) return;
+        if (g_callback || !g_active.load(std::memory_order_acquire)) return;
         ModInfo m = mod_of(ra);
         if (!m.match) return;
         std::string who;
         if (!class_match(who)) return;
         on = true; seq = ++g_seq;
+        long long parent_seq = g_jni_stack.empty() ? 0 : g_jni_stack.back();
+        g_jni_stack.push_back(seq);
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::system_clock::now().time_since_epoch()).count();
         buf = "{\"ev\":\"enter\",\"seq\":" + std::to_string(seq) +
               ",\"t\":" + std::to_string(ms) + ",\"tid\":" + std::to_string(cur_tid());
         s("fn", fn); s("mod", m.name.c_str());
+        raw("schema", "2");
+        raw("parent_seq", parent_seq ? std::to_string(parent_seq) : "null");
+        raw("native_id", current_native_id() ? std::to_string(current_native_id()) : "null");
         if (!who.empty()) s("in", who.c_str());
     }
     void raw(const char* k, const std::string& v) {
@@ -203,6 +221,7 @@ struct J {
         } else raw(k, jstr(v));
     }
     void p(const char* k, const void* v) { if (on) raw(k, v ? hexp(v) : "null"); }
+    void p(const char* k, jobject v) { if (on) raw(k, object_value(env, v)); }
     void n(const char* k, long long v) { if (on) raw(k, std::to_string(v)); }
     void flush() {
         if (!on || done) return;
@@ -224,12 +243,13 @@ struct J {
         fputs(buf.c_str(), g_f);
         if (g_flush_each) fflush(g_f);
     }
-    void ret_raw(const std::string& v) {
+    void ret_raw(const std::string& v, bool check_exception = true) {
         if (!on || exited) return;
         flush(); exited = true;
+        if (!g_jni_stack.empty() && g_jni_stack.back() == seq) g_jni_stack.pop_back();
         std::string l = "{\"ev\":\"exit\",\"seq\":" + std::to_string(seq);
         // Never treat an undefined JNI return value as a real value after an exception.
-        if (g_orig.ExceptionCheck(env)) l += ",\"exception\":true";
+        if (check_exception && g_orig.ExceptionCheck(env)) l += ",\"exception\":true";
         else if (!v.empty()) l += ",\"val\":" + v;
         l += "}\n";
         std::lock_guard<std::mutex> g(g_mu);
@@ -247,7 +267,11 @@ static std::string fv(jint v)     { return std::to_string((long long)v); }
 static std::string fv(jlong v)    { return std::to_string((long long)v); }
 static std::string fv(jfloat v)   { char b[48]; snprintf(b, sizeof b, "%.9g", (double)v); return std::isfinite(v) ? std::string(b) : jstr(b); }
 static std::string hexp(const void* p);
-static std::string fv(jobject v)  { return v ? hexp(v) : "null"; }
+static std::string fv(jobject v) {
+    JNIEnv* e = nullptr;
+    if (g_vm) g_vm->GetEnv((void**)&e, JNI_VERSION_1_6);
+    return object_value(e, v);
+}
 static std::string fv(jdouble v)  { char b[48]; snprintf(b, sizeof b, "%.17g", v); return std::isfinite(v) ? std::string(b) : jstr(b); }
 
 // String object -> text (uses ORIGINAL table, never re-enters hooks)
@@ -268,13 +292,31 @@ static std::string str_of(JNIEnv* env, jobject o) {
     return text;
 }
 static jclass g_strcls = nullptr;   // global ref to java.lang.String
-static std::string fvo(JNIEnv* env, jobject o, const char* sig) {
+static std::string object_value(JNIEnv* env, jobject o, bool known_valid) {
+    if (env && !known_valid && g_orig.ExceptionCheck(env)) return "null";
     if (!o) return "null";
-    if (g_orig.ExceptionCheck(env)) return hexp(o);
-    if (sig && !strcmp(sig, "Ljava/lang/String;")) return str_of(env, o);
-    // declared as Object/Comparable/etc: still show the text if it really is a String
-    if (g_strcls && g_orig.IsInstanceOf(env, o, g_strcls)) return str_of(env, o);
-    return hexp(o);
+    jlong tag = 0;
+    jvmtiError error = JVMTI_ERROR_MUST_POSSESS_CAPABILITY;
+    if (g_tags && env) {
+        std::lock_guard<std::mutex> lock(g_tagmu);
+        error = g_jvmti->GetTag(o, &tag);
+        if (error == JVMTI_ERROR_NONE && !tag) {
+            tag = ++g_object_seq;
+            error = g_jvmti->SetTag(o, tag);
+        }
+    }
+    return "{\"ref\":" + hexp(o) + ",\"object_id\":" +
+        (error == JVMTI_ERROR_NONE ? std::to_string(tag) : "null") +
+        ",\"identity_error\":" + std::to_string(error) + "}";
+}
+static std::string fvo(JNIEnv* env, jobject o, const char* sig) {
+    std::string out = object_value(env, o);
+    if (!o || g_orig.ExceptionCheck(env)) return out;
+    if ((sig && !strcmp(sig, "Ljava/lang/String;")) ||
+        (g_strcls && g_orig.IsInstanceOf(env, o, g_strcls))) {
+        out.pop_back(); out += ",\"text\":" + str_of(env, o) + "}";
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------- JVMTI lookups
@@ -362,7 +404,7 @@ template <class R> static std::string fval(JNIEnv* e, R v, const char* sig) {
     if constexpr (std::is_same_v<R, jobject>) return fvo(e, v, sig); else return fv(v);
 }
 template <class R> static void log_ret(J& j, JNIEnv* env, const MInfo& mi, R r) {
-    if constexpr (std::is_same_v<R, jobject>) j.ret_raw(fvo(env, r, ret_sig(mi.sig).c_str()));
+    if constexpr (std::is_same_v<R, jobject>) j.ret_raw(fvo(env, r, (mi.sig.size() && mi.sig[0] == '(' ? ret_sig(mi.sig) : mi.sig).c_str()));
     else j.ret_raw(fv(r));
 }
 
@@ -375,7 +417,7 @@ struct VaEnd { va_list& a; ~VaEnd() { va_end(a); } };
 // ---------------------------------------------------------------- simple hooks
 static jclass JNICALL h_FindClass(JNIEnv* e, const char* n) {
     J j(e, "FindClass", RET_ADDR()); j.s("name", n); j.flush();
-    jclass r = g_orig.FindClass(e, n); j.ret_raw(hexp(r)); return r;
+    jclass r = g_orig.FindClass(e, n); j.ret_raw(fv((jobject)r)); return r;
 }
 static jclass JNICALL h_DefineClass(JNIEnv* e, const char* n, jobject l, const jbyte* b, jsize len) {
     J j(e, "DefineClass", RET_ADDR()); j.s("name", n); j.n("len", len); j.flush();
@@ -412,12 +454,12 @@ static jfieldID JNICALL h_GetStaticFieldID(JNIEnv* e, jclass c, const char* n, c
     j.ret_raw(hexp(r)); return r;
 }
 static jstring JNICALL h_NewStringUTF(JNIEnv* e, const char* s) {
-    J j(e, "NewStringUTF", RET_ADDR()); j.s("str", s); j.flush(); jstring r = g_orig.NewStringUTF(e, s); j.ret_raw(fv((jobject)r)); return r;
+    J j(e, "NewStringUTF", RET_ADDR()); j.s("str", s); j.flush(); jstring r = g_orig.NewStringUTF(e, s); j.ret_raw(fvo(e, r, "Ljava/lang/String;")); return r;
 }
 static const char* JNICALL h_GetStringUTFChars(JNIEnv* e, jstring s, jboolean* c) {
-    J j(e, "GetStringUTFChars", RET_ADDR()); j.flush();
+    J j(e, "GetStringUTFChars", RET_ADDR()); j.p("string", (jobject)s); j.flush();
     const char* r = g_orig.GetStringUTFChars(e, s, c);
-    if (j.on) j.ret_raw(g_orig.ExceptionCheck(e) ? "" : jstr(r));
+    if (j.on) j.ret_raw(g_orig.ExceptionCheck(e) ? "" : "{\"pointer\":" + hexp(r) + ",\"text\":" + jstr(r) + "}");
     return r;
 }
 static jint JNICALL h_RegisterNatives(JNIEnv* e, jclass c, const JNINativeMethod* m, jint n) {
@@ -520,24 +562,24 @@ static jobject JNICALL h_NewObjectA(JNIEnv* e, jclass c, jmethodID m, const jval
 #define FIELD_HOOKS(T, R)                                                                             \
 static R JNICALL h_Get##T##Field(JNIEnv* e, jobject o, jfieldID f) {                                  \
     J j(e, "Get" #T "Field", RET_ADDR()); MInfo fi;                                                      \
-    if (j.on) { fi = finfo(f); j.s("class", fi.cls.c_str()); j.s("name", fi.name.c_str()); j.p("obj", o); } \
+    if (j.on) { fi = finfo(f); j.s("sig", fi.sig.c_str()); j.s("class", fi.cls.c_str()); j.s("name", fi.name.c_str()); j.p("field", (void*)f); j.p("obj", o); } \
     j.flush(); R r = g_orig.Get##T##Field(e, o, f); if (j.on) log_ret(j, e, fi, r); return r;         \
 }                                                                                                     \
 static void JNICALL h_Set##T##Field(JNIEnv* e, jobject o, jfieldID f, R v) {                          \
     J j(e, "Set" #T "Field", RET_ADDR());                                                                \
-    if (j.on) { MInfo fi = finfo(f); j.s("class", fi.cls.c_str()); j.s("name", fi.name.c_str());      \
+    if (j.on) { MInfo fi = finfo(f); j.s("class", fi.cls.c_str()); j.s("name", fi.name.c_str()); j.p("field", (void*)f);      \
         j.s("sig", fi.sig.c_str()); j.p("obj", o);                                                    \
         j.raw("val", fval<R>(e, v, fi.sig.c_str())); } \
     j.flush(); g_orig.Set##T##Field(e, o, f, v);                                                      \
 }                                                                                                     \
 static R JNICALL h_GetStatic##T##Field(JNIEnv* e, jclass c, jfieldID f) {                             \
     J j(e, "GetStatic" #T "Field", RET_ADDR()); MInfo fi;                                                \
-    if (j.on) { fi = finfo(f); j.s("class", fi.cls.c_str()); j.s("name", fi.name.c_str()); }          \
+    if (j.on) { fi = finfo(f); j.s("sig", fi.sig.c_str()); j.s("class", fi.cls.c_str()); j.s("name", fi.name.c_str()); j.p("field", (void*)f); }          \
     j.flush(); R r = g_orig.GetStatic##T##Field(e, c, f); if (j.on) log_ret(j, e, fi, r); return r;   \
 }                                                                                                     \
 static void JNICALL h_SetStatic##T##Field(JNIEnv* e, jclass c, jfieldID f, R v) {                     \
     J j(e, "SetStatic" #T "Field", RET_ADDR());                                                          \
-    if (j.on) { MInfo fi = finfo(f); j.s("class", fi.cls.c_str()); j.s("name", fi.name.c_str());      \
+    if (j.on) { MInfo fi = finfo(f); j.s("class", fi.cls.c_str()); j.s("name", fi.name.c_str()); j.p("field", (void*)f);      \
         j.s("sig", fi.sig.c_str());                                                                   \
         j.raw("val", fval<R>(e, v, fi.sig.c_str())); } \
     j.flush(); g_orig.SetStatic##T##Field(e, c, f, v);                                                \
@@ -560,9 +602,11 @@ static void JNICALL h_SetObjectArrayElement(JNIEnv* e, jobjectArray a, jsize i, 
     j.flush(); g_orig.SetObjectArrayElement(e, a, i, v);
 }
 static jobjectArray JNICALL h_NewObjectArray(JNIEnv* e, jsize n, jclass c, jobject init) {
-    J j(e, "NewObjectArray", RET_ADDR()); j.n("len", n); j.s("elem", sig_of_class(c).c_str()); j.flush();
-    jobjectArray r = g_orig.NewObjectArray(e, n, c, init); if (j.on) j.ret_raw(hexp(r)); return r;
+    J j(e, "NewObjectArray", RET_ADDR()); j.n("len", n); j.p("initial", init); j.s("elem", sig_of_class(c).c_str()); j.flush();
+    jobjectArray r = g_orig.NewObjectArray(e, n, c, init); if (j.on) j.ret_raw(fv((jobject)r)); return r;
 }
+
+#include "reconstruction_hooks.inc"
 
 // ---------------------------------------------------------------- install
 #define SET(name) g_new.name = h_##name
@@ -578,7 +622,7 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_jnitrace_Natives_init(JNIEnv* env, jclass, jstring jpath, jstring jfilter, jstring jdump, jboolean unknown, jstring jclasses, jint depth, jboolean compact, jboolean flushEach) {
     if (g_f) return g_active.load() ? JNI_TRUE : JNI_FALSE;
     JavaVM* vm = nullptr; env->GetJavaVM(&vm); g_vm = vm;
-    if (vm->GetEnv((void**)&g_jvmti, JVMTI_VERSION_1_2) != JNI_OK || !g_jvmti) return JNI_FALSE;
+    if (!g_jvmti && (vm->GetEnv((void**)&g_jvmti, JVMTI_VERSION_1_2) != JNI_OK || !g_jvmti)) return JNI_FALSE;
 
     const char* p = env->GetStringUTFChars(jpath, nullptr);
     g_f = fopen(p, "wb"); env->ReleaseStringUTFChars(jpath, p);
@@ -612,9 +656,15 @@ Java_jnitrace_Natives_init(JNIEnv* env, jclass, jstring jpath, jstring jfilter, 
     SET(GetObjectArrayElement); SET(SetObjectArrayElement); SET(NewObjectArray);
     ALL_TYPES(SET_CALLS)
     FIELD_TYPES(SET_FIELDS)
+    install_extra_hooks();
+    configure_live_events();
 
     g_active.store(true, std::memory_order_release);
-    if (g_jvmti->SetJNIFunctionTable(&g_new) == JVMTI_ERROR_NONE) return JNI_TRUE;
+    if (g_jvmti->SetJNIFunctionTable(&g_new) == JVMTI_ERROR_NONE) {
+        emit_session();
+        enable_boundaries();
+        return JNI_TRUE;
+    }
     g_active.store(false, std::memory_order_release);
     fclose(g_f); g_f = nullptr;
     return JNI_FALSE;
@@ -625,3 +675,5 @@ extern "C" JNIEXPORT void JNICALL Java_jnitrace_Natives_shutdown(JNIEnv*, jclass
     std::lock_guard<std::mutex> g(g_mu);
     if (g_f) { fflush(g_f); }   // keep hooks alive; file closed by process exit
 }
+
+#include "startup_agent.inc"
