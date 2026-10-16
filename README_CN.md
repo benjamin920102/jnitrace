@@ -1,4 +1,5 @@
 > **Reconstruction tracing source update / 還原追蹤原始碼更新**
+> See [docs/RECONSTRUCTION_CN.md](docs/RECONSTRUCTION_CN.md) for startup mode,
 > schema 2, capability limits, and operation conversion. 本次依要求未編譯或測試，沒有還原 JAR 輸出功能。
 > Object results are now structured objects with stable IDs and optional text.
 

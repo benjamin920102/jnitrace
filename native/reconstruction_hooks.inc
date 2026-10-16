@@ -68,7 +68,7 @@ static std::string entry_args(JNIEnv* e, jthread thread, const MInfo& mi) {
     });
 }
 static void JNICALL on_entry(jvmtiEnv* ti, JNIEnv* e, jthread thread, jmethodID m) {
-    if (g_callback || !g_active.load()) return;
+    if (g_callback || g_thread_ended || !g_active.load()) return;
     jint mods = 0;
     if (ti->GetMethodModifiers(m, &mods) != JVMTI_ERROR_NONE || !(mods & 0x100)) return;
     CallbackScope guard;
@@ -91,7 +91,7 @@ static void JNICALL on_entry(jvmtiEnv* ti, JNIEnv* e, jthread thread, jmethodID 
         ",\"receiver_error\":" + std::to_string(receiver_error) + ",\"args\":" + entry_args(e, thread, mi) + "}");
 }
 static void JNICALL on_exit(jvmtiEnv*, JNIEnv* e, jthread, jmethodID m, jboolean exception, jvalue v) {
-    if (g_callback || !g_active.load()) return;
+    if (g_callback || g_thread_ended || !g_active.load()) return;
     if (g_native_stack.empty() || g_native_stack.back().method != m) return;
     CallbackScope guard;
     NativeFrame f = g_native_stack.back(); g_native_stack.pop_back();
@@ -101,6 +101,13 @@ static void JNICALL on_exit(jvmtiEnv*, JNIEnv* e, jthread, jmethodID m, jboolean
         ",\"tid\":" + std::to_string(cur_tid()) + ",\"exception\":" + (exception ? "true" : "false");
     if (!exception && ret_sig(mi.sig) != "V") out += ",\"value\":" + typed_value(e, ret_sig(mi.sig), v);
     write_event(out + "}");
+}
+static void JNICALL on_thread_end(jvmtiEnv*, JNIEnv*, jthread) {
+    // Mark ended before destroying storage so late JNI calls take the bypass.
+    g_thread_ended = true;
+    InternalScope guard;
+    delete g_thread_state;
+    g_thread_state = nullptr;
 }
 static bool g_entry_enabled = false, g_exit_enabled = false, g_bind_enabled = false;
 static void configure_live_events() {
@@ -117,10 +124,11 @@ static void configure_live_events() {
     g_locals = have.can_access_local_variables;
     g_boundaries = have.can_generate_method_entry_events && have.can_generate_method_exit_events;
     jvmtiEventCallbacks cb{};
-    cb.NativeMethodBind = on_bind; cb.MethodEntry = on_entry; cb.MethodExit = on_exit;
+    cb.NativeMethodBind = on_bind; cb.MethodEntry = on_entry; cb.MethodExit = on_exit; cb.ThreadEnd = on_thread_end;
     if (g_jvmti->SetEventCallbacks(&cb, sizeof cb) != JVMTI_ERROR_NONE) {
         g_boundaries = false; g_bind_enabled = false; return;
     }
+    g_jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_THREAD_END, nullptr);
     if (have.can_generate_native_method_bind_events)
         g_bind_enabled = g_jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_NATIVE_METHOD_BIND, nullptr) == JVMTI_ERROR_NONE;
 }
@@ -155,19 +163,23 @@ template<class T> static std::string buffer_json(const T* p, jsize count) {
 }
 #define ARRAY_HOOKS(T, R) \
 static R##Array JNICALL h_New##T##Array(JNIEnv* e, jsize n) { \
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.New##T##Array(e, n); \
     J j(e, "New" #T "Array", RET_ADDR()); j.n("len", n); j.flush(); \
     auto r = g_orig.New##T##Array(e, n); if (j.on) j.ret_raw(object_value(e, r)); return r; \
 } \
 static void JNICALL h_Get##T##ArrayRegion(JNIEnv* e, R##Array a, jsize start, jsize n, R* b) { \
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.Get##T##ArrayRegion(e, a, start, n, b); \
     J j(e, "Get" #T "ArrayRegion", RET_ADDR()); j.p("array", (jobject)a); j.n("start", start); j.n("len", n); j.flush(); \
     g_orig.Get##T##ArrayRegion(e, a, start, n, b); \
     if (j.on && !g_orig.ExceptionCheck(e)) j.ret_raw(buffer_json(b, n)); \
 } \
 static void JNICALL h_Set##T##ArrayRegion(JNIEnv* e, R##Array a, jsize start, jsize n, const R* b) { \
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.Set##T##ArrayRegion(e, a, start, n, b); \
     J j(e, "Set" #T "ArrayRegion", RET_ADDR()); j.p("array", (jobject)a); j.n("start", start); j.n("len", n); \
     if (j.on) j.raw("buffer", buffer_json(b, n)); j.flush(); g_orig.Set##T##ArrayRegion(e, a, start, n, b); \
 } \
 static R* JNICALL h_Get##T##ArrayElements(JNIEnv* e, R##Array a, jboolean* copy) { \
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.Get##T##ArrayElements(e, a, copy); \
     J j(e, "Get" #T "ArrayElements", RET_ADDR()); j.p("array", (jobject)a); j.flush(); \
     R* r = g_orig.Get##T##ArrayElements(e, a, copy); \
     if (j.on && r && !g_orig.ExceptionCheck(e)) { \
@@ -176,6 +188,7 @@ static R* JNICALL h_Get##T##ArrayElements(JNIEnv* e, R##Array a, jboolean* copy)
     } return r; \
 } \
 static void JNICALL h_Release##T##ArrayElements(JNIEnv* e, R##Array a, R* b, jint mode) { \
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.Release##T##ArrayElements(e, a, b, mode); \
     J j(e, "Release" #T "ArrayElements", RET_ADDR()); j.p("array", (jobject)a); j.p("pointer", (void*)b); j.n("mode", mode); \
     if (j.on && b && !g_orig.ExceptionCheck(e)) j.raw("buffer", buffer_json(b, g_orig.GetArrayLength(e, a))); \
     j.flush(); g_orig.Release##T##ArrayElements(e, a, b, mode); \
@@ -184,6 +197,7 @@ static void JNICALL h_Release##T##ArrayElements(JNIEnv* e, R##Array a, R* b, jin
 PRIMITIVES(ARRAY_HOOKS)
 #define REF_NEW(Name, Type) \
 static Type JNICALL h_##Name(JNIEnv* e, jobject o) { \
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.Name(e, o); \
     J j(e, #Name, RET_ADDR()); j.p("obj", o); j.flush(); auto r = g_orig.Name(e, o); \
     if (j.on) j.ret_raw(object_value(e, r)); return r; \
 }
@@ -192,40 +206,49 @@ REF_NEW(NewGlobalRef, jobject)
 REF_NEW(NewWeakGlobalRef, jweak)
 #define REF_DELETE(Name, Type) \
 static void JNICALL h_##Name(JNIEnv* e, Type o) { \
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.Name(e, o); \
     J j(e, #Name, RET_ADDR()); j.p("obj", (jobject)o); j.flush(); g_orig.Name(e, o); \
 }
 REF_DELETE(DeleteLocalRef, jobject)
 REF_DELETE(DeleteGlobalRef, jobject)
 REF_DELETE(DeleteWeakGlobalRef, jweak)
 static jboolean JNICALL h_IsSameObject(JNIEnv* e, jobject a, jobject b) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.IsSameObject(e, a, b);
     J j(e, "IsSameObject", RET_ADDR()); j.p("left", a); j.p("right", b); j.flush();
     auto r = g_orig.IsSameObject(e, a, b); j.ret_raw(fv(r)); return r;
 }
 static jint JNICALL h_PushLocalFrame(JNIEnv* e, jint capacity) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.PushLocalFrame(e, capacity);
     J j(e, "PushLocalFrame", RET_ADDR()); j.n("capacity", capacity); j.flush();
     auto r = g_orig.PushLocalFrame(e, capacity); j.ret_raw(fv(r)); return r;
 }
 static jobject JNICALL h_PopLocalFrame(JNIEnv* e, jobject o) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.PopLocalFrame(e, o);
     J j(e, "PopLocalFrame", RET_ADDR()); j.p("obj", o); j.flush();
-    auto r = g_orig.PopLocalFrame(e, o); j.ret_raw(object_value(e, r)); return r;
+    auto r = g_orig.PopLocalFrame(e, o); if (j.on) j.ret_raw(object_value(e, r)); return r;
 }
 static jsize JNICALL h_GetArrayLength(JNIEnv* e, jarray a) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.GetArrayLength(e, a);
     J j(e, "GetArrayLength", RET_ADDR()); j.p("array", (jobject)a); j.flush();
     auto r = g_orig.GetArrayLength(e, a); j.ret_raw(fv(r)); return r;
 }
 static jstring JNICALL h_NewString(JNIEnv* e, const jchar* b, jsize n) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.NewString(e, b, n);
     J j(e, "NewString", RET_ADDR()); j.n("len", n); if (j.on) j.raw("utf16", buffer_json(b, n)); j.flush();
     auto r = g_orig.NewString(e, b, n); if (j.on) j.ret_raw(fvo(e, r, "Ljava/lang/String;")); return r;
 }
 static jsize JNICALL h_GetStringLength(JNIEnv* e, jstring s) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.GetStringLength(e, s);
     J j(e, "GetStringLength", RET_ADDR()); j.p("string", (jobject)s); j.flush();
     auto r = g_orig.GetStringLength(e, s); j.ret_raw(fv(r)); return r;
 }
 static jsize JNICALL h_GetStringUTFLength(JNIEnv* e, jstring s) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.GetStringUTFLength(e, s);
     J j(e, "GetStringUTFLength", RET_ADDR()); j.p("string", (jobject)s); j.flush();
     auto r = g_orig.GetStringUTFLength(e, s); j.ret_raw(fv(r)); return r;
 }
 static const jchar* JNICALL h_GetStringChars(JNIEnv* e, jstring s, jboolean* copy) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.GetStringChars(e, s, copy);
     J j(e, "GetStringChars", RET_ADDR()); j.p("string", (jobject)s); j.flush();
     auto r = g_orig.GetStringChars(e, s, copy);
     if (j.on && r && !g_orig.ExceptionCheck(e)) j.ret_raw("{\"pointer\":" + hexp(r) +
@@ -233,19 +256,23 @@ static const jchar* JNICALL h_GetStringChars(JNIEnv* e, jstring s, jboolean* cop
     return r;
 }
 static void JNICALL h_ReleaseStringChars(JNIEnv* e, jstring s, const jchar* b) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.ReleaseStringChars(e, s, b);
     J j(e, "ReleaseStringChars", RET_ADDR()); j.p("string", (jobject)s); j.p("pointer", (void*)b); j.flush();
     g_orig.ReleaseStringChars(e, s, b);
 }
 static void JNICALL h_ReleaseStringUTFChars(JNIEnv* e, jstring s, const char* b) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.ReleaseStringUTFChars(e, s, b);
     J j(e, "ReleaseStringUTFChars", RET_ADDR()); j.p("string", (jobject)s); j.p("pointer", (void*)b); j.flush();
     g_orig.ReleaseStringUTFChars(e, s, b);
 }
 static void JNICALL h_GetStringRegion(JNIEnv* e, jstring s, jsize start, jsize n, jchar* b) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.GetStringRegion(e, s, start, n, b);
     J j(e, "GetStringRegion", RET_ADDR()); j.p("string", (jobject)s); j.n("start", start); j.n("len", n); j.flush();
     g_orig.GetStringRegion(e, s, start, n, b);
     if (j.on && !g_orig.ExceptionCheck(e)) j.ret_raw(buffer_json(b, n));
 }
 static void JNICALL h_GetStringUTFRegion(JNIEnv* e, jstring s, jsize start, jsize n, char* b) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.GetStringUTFRegion(e, s, start, n, b);
     J j(e, "GetStringUTFRegion", RET_ADDR()); j.p("string", (jobject)s); j.n("start", start); j.n("len", n); j.flush();
     g_orig.GetStringUTFRegion(e, s, start, n, b);
     // JNI does not NUL-terminate this buffer. Read exactly the MUTF-8 length derived from original UTF-16 units.
@@ -260,33 +287,41 @@ static void JNICALL h_GetStringUTFRegion(JNIEnv* e, jstring s, jsize start, jsiz
     }
 }
 static jboolean JNICALL h_ExceptionCheck(JNIEnv* e) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.ExceptionCheck(e);
     J j(e, "ExceptionCheck", RET_ADDR()); j.flush(); auto r = g_orig.ExceptionCheck(e);
     j.ret_raw(fv(r), false); return r;
 }
 static jthrowable JNICALL h_ExceptionOccurred(JNIEnv* e) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.ExceptionOccurred(e);
     J j(e, "ExceptionOccurred", RET_ADDR()); j.flush(); auto r = g_orig.ExceptionOccurred(e);
     if (j.on) j.ret_raw(object_value(e, r, true), false); return r;
 }
 static void JNICALL h_ExceptionClear(JNIEnv* e) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.ExceptionClear(e);
     J j(e, "ExceptionClear", RET_ADDR()); j.flush(); g_orig.ExceptionClear(e);
 }
 static jobject JNICALL h_AllocObject(JNIEnv* e, jclass c) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.AllocObject(e, c);
     J j(e, "AllocObject", RET_ADDR()); j.p("class_object", (jobject)c); j.flush();
     auto r = g_orig.AllocObject(e, c); if (j.on) j.ret_raw(object_value(e, r)); return r;
 }
 static jclass JNICALL h_GetObjectClass(JNIEnv* e, jobject o) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.GetObjectClass(e, o);
     J j(e, "GetObjectClass", RET_ADDR()); j.p("obj", o); j.flush();
     auto r = g_orig.GetObjectClass(e, o); if (j.on) j.ret_raw(object_value(e, r)); return r;
 }
 static jboolean JNICALL h_IsInstanceOf(JNIEnv* e, jobject o, jclass c) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.IsInstanceOf(e, o, c);
     J j(e, "IsInstanceOf", RET_ADDR()); j.p("obj", o); j.p("class_object", (jobject)c); j.flush();
     auto r = g_orig.IsInstanceOf(e, o, c); j.ret_raw(fv(r)); return r;
 }
 static jobjectRefType JNICALL h_GetObjectRefType(JNIEnv* e, jobject o) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.GetObjectRefType(e, o);
     J j(e, "GetObjectRefType", RET_ADDR()); j.p("obj", o); j.flush();
     auto r = g_orig.GetObjectRefType(e, o); j.ret_raw(std::to_string((int)r)); return r;
 }
 static jint JNICALL h_UnregisterNatives(JNIEnv* e, jclass c) {
+    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.UnregisterNatives(e, c);
     J j(e, "UnregisterNatives", RET_ADDR()); j.p("class_object", (jobject)c); j.flush();
     auto r = g_orig.UnregisterNatives(e, c); j.ret_raw(fv(r)); return r;
 }

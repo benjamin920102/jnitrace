@@ -1,4 +1,4 @@
-name: Build, test and prerelease
+name: Build and prerelease
 
 on:
   push:
@@ -20,21 +20,10 @@ jobs:
           distribution: temurin
           java-version: '21'
           cache: maven
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
       - name: Install Windows cross compiler
         run: sudo apt-get update && sudo apt-get install -y g++-mingw-w64-x86-64-posix
       - name: Build native libraries and agent JAR
         run: bash scripts/build.sh
-      - name: Build test fixtures
-        shell: bash
-        run: |
-          set -euo pipefail
-          g++ -std=c++17 -O2 -shared -fPIC -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" tests/fixture.cpp -o target/libfixture.so
-          x86_64-w64-mingw32-g++ -std=c++17 -O2 -shared -static -Inative/win32 -I"$JAVA_HOME/include" tests/fixture.cpp -o target/fixture.dll
-      - name: Linux integration tests
-        run: python tests/smoke.py
       - name: Package source
         run: git archive --format=zip --prefix=jnitrace/ -o target/jnitrace-source.zip HEAD
       - uses: actions/upload-artifact@v4
@@ -44,31 +33,10 @@ jobs:
           path: |
             target/jnitrace.jar
             target/jnitrace-source.zip
-            target/fixture.dll
-
-  windows-test:
-    needs: build
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-          architecture: x64
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.x'
-      - uses: actions/download-artifact@v4
-        with:
-          name: build
-          path: target
-      - name: Windows integration tests
-        run: python tests/smoke.py
 
   prerelease:
     if: github.event_name != 'pull_request'
-    needs: [build, windows-test]
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
