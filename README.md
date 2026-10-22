@@ -1,3 +1,5 @@
+> 1.2 擴充：新增 Java → native entry/return、primitive arrays、完整傳統 String JNI、exception 查詢、模組 VA/base/RVA。完整用法、限制與測試見 [TRACE_EXTENSIONS_CN.md](TRACE_EXTENSIONS_CN.md)。
+
 # jnitrace
 
 JNI function-table tracer bundled as a Java agent. The build includes Windows x64
@@ -38,26 +40,6 @@ traffic can produce very large files.
 | `compact=0` | — | Inline full metadata in every enter record; easier for existing readers. |
 | `flush=1` | 0 | Flush each record for live tailing/crash investigations. Default: 64 KiB stdio buffer, flushed on normal shutdown. |
 | `dump=1` | 0 | Dump bytes passed to intercepted JNI `DefineClass` calls into `defined_classes/`. |
-
-## DLL base, VA and RVA
-
-Every `enter` includes inline hexadecimal strings `va`, `rva`, and `dll_base`,
-in both plain and compact modes. No additional option is required. The loader
-provides the module base (Windows module handle / Linux `dladdr`); the tracer
-computes `rva = va - dll_base`, so `dll_base = va - rva`.
-
-```json
-{"va":"0x7ffc1ff759fb","rva":"0x3159fb","dll_base":"0x7ffc1fc60000"}
-```
-
-`va` is the native return address after the intercepted JNI call, not the start
-of its call instruction. Instruction lengths vary; do not blindly subtract 5.
-For JNI calls made through a wrapper, this identifies the call inside that wrapper,
-not a complete native stack. RVA is a memory offset, not a file offset. Unknown
-modules retain `va` but use JSON null for `dll_base` and `rva`. Pair an `exit` with
-its `enter` using `seq` to retrieve these addresses. ASLR may change the base
-between runs; use addresses from the same trace. Hex strings avoid 64-bit JSON
-number precision loss, and a valid zero RVA is recorded as `"0x0"`.
 
 ## Events and size reduction
 

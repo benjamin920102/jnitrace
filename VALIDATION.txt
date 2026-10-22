@@ -1,0 +1,17 @@
+Validated on Linux x64, OpenJDK 17.0.20, 2026-10-22.
+Native Linux build: g++ -Wall -Wextra -Werror, passed.
+Native Windows build: shipped build-dll.sh + static libffi 3.4.6, passed.
+PE imports: KERNEL32.dll, msvcrt.dll (no external libffi/pthread DLL).
+Windows JVM runtime: not available; not tested here.
+
+python tests/smoke.py
+Smoke passed; plain=1825016 compact=1331413 bytes
+
+python tests/coverage.py
+Coverage compact=0: 1207 paired calls, 121 native invocations; passed
+Coverage compact=1: 1206 paired calls, 121 native invocations; passed
+Record counts can vary due to concurrent initial native binding.
+Coverage compares untraced vs traced semantic fixtures under -Xcheck:jni.
+Tests check exact mixed ABI arguments, primitive native returns, static and
+instance methods, export and RegisterNatives binding, nested native invocation,
+arrays and strings, exceptions, invalid region range, seq pairs, VA/base/RVA.

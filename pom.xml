@@ -1,6 +1,6 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0">
   <modelVersion>4.0.0</modelVersion>
-  <groupId>jnitrace</groupId><artifactId>jnitrace</artifactId><version>1.1.0</version>
+  <groupId>jnitrace</groupId><artifactId>jnitrace</artifactId><version>1.2.0</version>
   <properties>
     <maven.compiler.release>11</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>

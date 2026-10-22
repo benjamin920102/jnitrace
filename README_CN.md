@@ -1,3 +1,5 @@
+> 1.2 擴充：新增 Java → native entry/return、primitive arrays、完整傳統 String JNI、exception 查詢、模組 VA/base/RVA。完整用法、限制與測試見 [TRACE_EXTENSIONS_CN.md](TRACE_EXTENSIONS_CN.md)。
+
 # jnitrace：JNI 呼叫追蹤器
 
 原始碼包含 Windows x64 / Linux x64 建置流程，使用 GitHub Actions 的 JDK 21 編譯。
@@ -21,23 +23,6 @@ java "-javaagent:jnitrace.jar=module=EveryDay,include=obf.*;native.*,depth=4,out
 `module=EveryDay` 比對的是**載入的 DLL 檔名**，不是 JAR 名稱；若 DLL 叫隨機的
 `lib123.tmp`，此條件就不會符合。遇到這類情況可只用 `include=`。
 同時設定 module 與 include 時，兩者都必須符合。
-
-## DLL base／VA／RVA
-
-每筆 `enter` 自動加入以下欄位，`compact=0`／`compact=1` 都會直接記錄：
-
-```json
-{"va":"0x7ffc1ff759fb","rva":"0x3159fb","dll_base":"0x7ffc1fc60000"}
-```
-
-`dll_base = VA − RVA`。模組基底由 Windows loader（Linux 使用 `dladdr`）取得，
-再以 `RVA = VA − dll_base` 計算偏移。位址使用十六進位字串，避免 JSON 數字精度問題。
-`va` 是 native 呼叫 JNI 後的返回位址，不是 `call` 指令起點；不同指令長度不同，
-不可固定減 5。如果 JNI 是由 wrapper 呼叫，這些欄位對應 wrapper 內的呼叫位置。
-它們不代表完整 native call stack，也不是 DLL 檔案偏移。
-無法辨識模組時仍記錄 `va`，`dll_base`／`rva` 為 `null`。
-`exit` 透過相同 `seq` 對應 `enter` 的位址；不需要新增啟動參數。
-每次重新啟動程序，ASLR 可能改變 base，請使用該次 trace 的值。
 
 ## 這版改動
 
