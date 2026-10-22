@@ -42,40 +42,9 @@ static std::string        g_filter;      // lower-case substring of module name;
 static std::string        g_dumpdir;     // DefineClass dump dir (optional)
 static bool               g_unknown = false;
 static std::vector<std::string> g_classpat;  // glob patterns on dotted class name; empty = no class filter
-static bool g_tags = false, g_boundaries = false;
-static thread_local bool g_callback = false;
-
-struct NativeFrame { jmethodID method; long long id; bool selected; };
-// Trivial TLS only: vector destructors must not run during CRT thread teardown
-// while the JVM can still enter an installed JNI hook.
-struct TraceThreadState {
-    std::vector<long long> jni;
-    std::vector<NativeFrame> native;
-};
-static thread_local TraceThreadState* g_thread_state = nullptr;
-static thread_local bool g_thread_ended = false;
-static TraceThreadState& thread_state() {
-    if (!g_thread_state) g_thread_state = new TraceThreadState;
-    return *g_thread_state;
-}
-#define g_jni_stack (thread_state().jni)
-#define g_native_stack (thread_state().native)
-struct InternalScope {
-    bool previous;
-    InternalScope() : previous(g_callback) { g_callback = true; }
-    ~InternalScope() { g_callback = previous; }
-};
-static long long current_native_id() {
-    for (auto it = g_native_stack.rbegin(); it != g_native_stack.rend(); ++it)
-        if (it->selected) return it->id;
-    return 0;
-}
-static std::mutex g_tagmu;
-static std::atomic<long long> g_object_seq{0}, g_frame_seq{0};
-static std::string object_value(JNIEnv*, jobject, bool = false);
 static int                g_depth = 1;       // how many Java frames (from top) to test against g_classpat // log calls whose caller module is unknown
 
-struct ModInfo { bool match; std::string name; };
+struct ModInfo { bool match; std::string name; void* base = nullptr; };
 static std::mutex g_modmu;
 static std::unordered_map<void*, ModInfo> g_modcache;
 
@@ -106,7 +75,7 @@ static ModInfo mod_of(void* ra) {
     size_t p = path.find_last_of("/\\");
     std::string name = p == std::string::npos ? path : path.substr(p + 1);
     bool m = g_filter.empty() || lower(name).find(g_filter) != std::string::npos;
-    ModInfo mi{ m, name };
+    ModInfo mi{ m, name, base };
     std::lock_guard<std::mutex> g(g_modmu);
     g_modcache[base] = mi;
     return mi;
@@ -165,13 +134,11 @@ static bool glob(const char* p, const char* t) {
 static std::mutex g_cfmu;
 static std::unordered_map<jmethodID, std::string> g_mclass;   // method -> dotted class name
 static void release_class(jclass c) {
-    InternalScope guard;
     JNIEnv* env = nullptr;
     if (c && g_vm && g_vm->GetEnv((void**)&env, JNI_VERSION_1_6) == JNI_OK)
         g_orig.DeleteLocalRef(env, c);
 }
 static std::string dotted_class_of(jmethodID m) {
-    InternalScope guard;
     { std::lock_guard<std::mutex> g(g_cfmu); auto it = g_mclass.find(m); if (it != g_mclass.end()) return it->second; }
     std::string r; jclass dc = nullptr; char* sg = nullptr;
     if (g_jvmti->GetMethodDeclaringClass(m, &dc) == JVMTI_ERROR_NONE && dc &&
@@ -185,7 +152,6 @@ static std::string dotted_class_of(jmethodID m) {
 }
 // Returns true if one of the top g_depth Java frames of the current thread is in a matching class.
 static bool class_match(std::string& who) {
-    InternalScope guard;
     if (g_classpat.empty()) return true;
     jvmtiFrameInfo fr[16]; jint cnt = 0;
     int d = g_depth < 1 ? 1 : (g_depth > 16 ? 16 : g_depth);
@@ -211,23 +177,26 @@ struct J {
     long long seq = 0;
     JNIEnv* env;
     J(JNIEnv* e, const char* fn, void* ra) : env(e) {
-        if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return;
-        InternalScope guard;
+        if (!g_active.load(std::memory_order_acquire)) return;
         ModInfo m = mod_of(ra);
         if (!m.match) return;
         std::string who;
         if (!class_match(who)) return;
         on = true; seq = ++g_seq;
-        long long parent_seq = g_jni_stack.empty() ? 0 : g_jni_stack.back();
-        g_jni_stack.push_back(seq);
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::system_clock::now().time_since_epoch()).count();
         buf = "{\"ev\":\"enter\",\"seq\":" + std::to_string(seq) +
               ",\"t\":" + std::to_string(ms) + ",\"tid\":" + std::to_string(cur_tid());
         s("fn", fn); s("mod", m.name.c_str());
-        raw("schema", "2");
-        raw("parent_seq", parent_seq ? std::to_string(parent_seq) : "null");
-        raw("native_id", current_native_id() ? std::to_string(current_native_id()) : "null");
+        // RET_ADDR is the return VA after the intercepted JNI call, not its opcode.
+        // Keep addresses inline even in compact mode; hex strings preserve all 64 bits.
+        p("va", ra);
+        p("dll_base", m.base);
+        if (m.base) {
+            uintptr_t rva = (uintptr_t)ra - (uintptr_t)m.base;
+            // Unlike a null pointer, a zero RVA is a valid offset.
+            raw("rva", hexp((const void*)rva));
+        } else raw("rva", "null");
         if (!who.empty()) s("in", who.c_str());
     }
     void raw(const char* k, const std::string& v) {
@@ -243,7 +212,6 @@ struct J {
         } else raw(k, jstr(v));
     }
     void p(const char* k, const void* v) { if (on) raw(k, v ? hexp(v) : "null"); }
-    void p(const char* k, jobject v) { if (on) raw(k, object_value(env, v)); }
     void n(const char* k, long long v) { if (on) raw(k, std::to_string(v)); }
     void flush() {
         if (!on || done) return;
@@ -265,14 +233,12 @@ struct J {
         fputs(buf.c_str(), g_f);
         if (g_flush_each) fflush(g_f);
     }
-    void ret_raw(const std::string& v, bool check_exception = true) {
-    InternalScope guard;
+    void ret_raw(const std::string& v) {
         if (!on || exited) return;
         flush(); exited = true;
-        if (!g_jni_stack.empty() && g_jni_stack.back() == seq) g_jni_stack.pop_back();
         std::string l = "{\"ev\":\"exit\",\"seq\":" + std::to_string(seq);
         // Never treat an undefined JNI return value as a real value after an exception.
-        if (check_exception && g_orig.ExceptionCheck(env)) l += ",\"exception\":true";
+        if (g_orig.ExceptionCheck(env)) l += ",\"exception\":true";
         else if (!v.empty()) l += ",\"val\":" + v;
         l += "}\n";
         std::lock_guard<std::mutex> g(g_mu);
@@ -290,16 +256,11 @@ static std::string fv(jint v)     { return std::to_string((long long)v); }
 static std::string fv(jlong v)    { return std::to_string((long long)v); }
 static std::string fv(jfloat v)   { char b[48]; snprintf(b, sizeof b, "%.9g", (double)v); return std::isfinite(v) ? std::string(b) : jstr(b); }
 static std::string hexp(const void* p);
-static std::string fv(jobject v) {
-    JNIEnv* e = nullptr;
-    if (g_vm) g_vm->GetEnv((void**)&e, JNI_VERSION_1_6);
-    return object_value(e, v);
-}
+static std::string fv(jobject v)  { return v ? hexp(v) : "null"; }
 static std::string fv(jdouble v)  { char b[48]; snprintf(b, sizeof b, "%.17g", v); return std::isfinite(v) ? std::string(b) : jstr(b); }
 
 // String object -> text (uses ORIGINAL table, never re-enters hooks)
 static std::string str_of(JNIEnv* env, jobject o) {
-    InternalScope guard;
     if (!o) return "null";
     if (g_orig.ExceptionCheck(env)) return hexp(o);
     const jchar* chars = g_orig.GetStringChars(env, (jstring)o, nullptr);
@@ -316,33 +277,13 @@ static std::string str_of(JNIEnv* env, jobject o) {
     return text;
 }
 static jclass g_strcls = nullptr;   // global ref to java.lang.String
-static std::string object_value(JNIEnv* env, jobject o, bool known_valid) {
-    InternalScope guard;
-    if (env && !known_valid && g_orig.ExceptionCheck(env)) return "null";
-    if (!o) return "null";
-    jlong tag = 0;
-    jvmtiError error = JVMTI_ERROR_MUST_POSSESS_CAPABILITY;
-    if (g_tags && env) {
-        std::lock_guard<std::mutex> lock(g_tagmu);
-        error = g_jvmti->GetTag(o, &tag);
-        if (error == JVMTI_ERROR_NONE && !tag) {
-            tag = ++g_object_seq;
-            error = g_jvmti->SetTag(o, tag);
-        }
-    }
-    return "{\"ref\":" + hexp(o) + ",\"object_id\":" +
-        (error == JVMTI_ERROR_NONE ? std::to_string(tag) : "null") +
-        ",\"identity_error\":" + std::to_string(error) + "}";
-}
 static std::string fvo(JNIEnv* env, jobject o, const char* sig) {
-    InternalScope guard;
-    std::string out = object_value(env, o);
-    if (!o || g_orig.ExceptionCheck(env)) return out;
-    if ((sig && !strcmp(sig, "Ljava/lang/String;")) ||
-        (g_strcls && g_orig.IsInstanceOf(env, o, g_strcls))) {
-        out.pop_back(); out += ",\"text\":" + str_of(env, o) + "}";
-    }
-    return out;
+    if (!o) return "null";
+    if (g_orig.ExceptionCheck(env)) return hexp(o);
+    if (sig && !strcmp(sig, "Ljava/lang/String;")) return str_of(env, o);
+    // declared as Object/Comparable/etc: still show the text if it really is a String
+    if (g_strcls && g_orig.IsInstanceOf(env, o, g_strcls)) return str_of(env, o);
+    return hexp(o);
 }
 
 // ---------------------------------------------------------------- JVMTI lookups
@@ -352,7 +293,6 @@ static std::unordered_map<jmethodID, MInfo> g_mcache;
 static std::unordered_map<jfieldID, MInfo> g_fcache;
 
 static std::string sig_of_class(jclass c) {
-    InternalScope guard;
     char* sg = nullptr; std::string r = "?";
     if (g_jvmti && c && g_jvmti->GetClassSignature(c, &sg, nullptr) == JVMTI_ERROR_NONE && sg) {
         r = sg; g_jvmti->Deallocate((unsigned char*)sg);
@@ -360,7 +300,6 @@ static std::string sig_of_class(jclass c) {
     return r;
 }
 static MInfo minfo(jmethodID m) {
-    InternalScope guard;
     { std::lock_guard<std::mutex> g(g_cmu); auto it = g_mcache.find(m); if (it != g_mcache.end()) return it->second; }
     MInfo r; r.name = "?"; r.cls = "?";
     char *n = nullptr, *s = nullptr; jclass dc = nullptr;
@@ -375,7 +314,6 @@ static MInfo minfo(jmethodID m) {
     std::lock_guard<std::mutex> g(g_cmu); g_mcache[m] = r; return r;
 }
 static MInfo finfo(jfieldID f) {
-    InternalScope guard;
     std::lock_guard<std::mutex> g(g_cmu);
     auto it = g_fcache.find(f); if (it != g_fcache.end()) return it->second;
     MInfo r; r.name = "?"; r.cls = "?"; return r;
@@ -433,12 +371,8 @@ template <class R> static std::string fval(JNIEnv* e, R v, const char* sig) {
     if constexpr (std::is_same_v<R, jobject>) return fvo(e, v, sig); else return fv(v);
 }
 template <class R> static void log_ret(J& j, JNIEnv* env, const MInfo& mi, R r) {
-    if (!j.on) return;
-    if constexpr (std::is_same_v<R, jobject>) {
-        j.ret_raw(fvo(env, r, (mi.sig.size() && mi.sig[0] == '(' ? ret_sig(mi.sig) : mi.sig).c_str()));
-    } else {
-        j.ret_raw(fv(r));
-    }
+    if constexpr (std::is_same_v<R, jobject>) j.ret_raw(fvo(env, r, ret_sig(mi.sig).c_str()));
+    else j.ret_raw(fv(r));
 }
 
 template <class R, class F> static R do_call(J& j, JNIEnv* e, const MInfo& mi, F f) {
@@ -449,12 +383,10 @@ struct VaEnd { va_list& a; ~VaEnd() { va_end(a); } };
 
 // ---------------------------------------------------------------- simple hooks
 static jclass JNICALL h_FindClass(JNIEnv* e, const char* n) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.FindClass(e, n);
     J j(e, "FindClass", RET_ADDR()); j.s("name", n); j.flush();
-    jclass r = g_orig.FindClass(e, n); if (j.on) j.ret_raw(fv((jobject)r)); return r;
+    jclass r = g_orig.FindClass(e, n); j.ret_raw(hexp(r)); return r;
 }
 static jclass JNICALL h_DefineClass(JNIEnv* e, const char* n, jobject l, const jbyte* b, jsize len) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.DefineClass(e, n, l, b, len);
     J j(e, "DefineClass", RET_ADDR()); j.s("name", n); j.n("len", len); j.flush();
     if (j.on && !g_dumpdir.empty() && b && len > 0) {
         std::string nm = n ? n : ("anon_" + std::to_string(j.seq));
@@ -462,49 +394,42 @@ static jclass JNICALL h_DefineClass(JNIEnv* e, const char* n, jobject l, const j
         std::string path = g_dumpdir + "/" + nm + "_" + std::to_string(j.seq) + ".class";
         if (FILE* f = fopen(path.c_str(), "wb")) { fwrite(b, 1, (size_t)len, f); fclose(f); }
     }
-    jclass r = g_orig.DefineClass(e, n, l, b, len); if (j.on) j.ret_raw(fv((jobject)r)); return r;
+    jclass r = g_orig.DefineClass(e, n, l, b, len); j.ret_raw(fv((jobject)r)); return r;
 }
 static jmethodID JNICALL h_GetMethodID(JNIEnv* e, jclass c, const char* n, const char* s) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.GetMethodID(e, c, n, s);
     J j(e, "GetMethodID", RET_ADDR()); if (j.on) j.s("class", sig_of_class(c).c_str());
     j.s("name", n); j.s("sig", s); j.flush(); jmethodID r = g_orig.GetMethodID(e, c, n, s); j.ret_raw(hexp(r)); return r;
 }
 static jmethodID JNICALL h_GetStaticMethodID(JNIEnv* e, jclass c, const char* n, const char* s) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.GetStaticMethodID(e, c, n, s);
     J j(e, "GetStaticMethodID", RET_ADDR()); if (j.on) j.s("class", sig_of_class(c).c_str());
     j.s("name", n); j.s("sig", s); j.flush(); jmethodID r = g_orig.GetStaticMethodID(e, c, n, s); j.ret_raw(hexp(r)); return r;
 }
 static jfieldID JNICALL h_GetFieldID(JNIEnv* e, jclass c, const char* n, const char* s) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.GetFieldID(e, c, n, s);
-    J j(e, "GetFieldID", RET_ADDR()); std::string cs = j.on ? sig_of_class(c) : "?";
+    J j(e, "GetFieldID", RET_ADDR()); std::string cs = sig_of_class(c);
     if (j.on) j.s("class", cs.c_str());
     j.s("name", n); j.s("sig", s); j.flush();
     jfieldID r = g_orig.GetFieldID(e, c, n, s);
-    if (j.on && r) { std::lock_guard<std::mutex> g(g_cmu); g_fcache[r] = { cs, n ? n : "", s ? s : "", false }; }
+    if (r) { std::lock_guard<std::mutex> g(g_cmu); g_fcache[r] = { cs, n ? n : "", s ? s : "", false }; }
     j.ret_raw(hexp(r)); return r;
 }
 static jfieldID JNICALL h_GetStaticFieldID(JNIEnv* e, jclass c, const char* n, const char* s) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.GetStaticFieldID(e, c, n, s);
-    J j(e, "GetStaticFieldID", RET_ADDR()); std::string cs = j.on ? sig_of_class(c) : "?";
+    J j(e, "GetStaticFieldID", RET_ADDR()); std::string cs = sig_of_class(c);
     if (j.on) j.s("class", cs.c_str());
     j.s("name", n); j.s("sig", s); j.flush();
     jfieldID r = g_orig.GetStaticFieldID(e, c, n, s);
-    if (j.on && r) { std::lock_guard<std::mutex> g(g_cmu); g_fcache[r] = { cs, n ? n : "", s ? s : "", true }; }
+    if (r) { std::lock_guard<std::mutex> g(g_cmu); g_fcache[r] = { cs, n ? n : "", s ? s : "", true }; }
     j.ret_raw(hexp(r)); return r;
 }
 static jstring JNICALL h_NewStringUTF(JNIEnv* e, const char* s) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.NewStringUTF(e, s);
-    J j(e, "NewStringUTF", RET_ADDR()); j.s("str", s); j.flush(); jstring r = g_orig.NewStringUTF(e, s); if (j.on) j.ret_raw(fvo(e, r, "Ljava/lang/String;")); return r;
+    J j(e, "NewStringUTF", RET_ADDR()); j.s("str", s); j.flush(); jstring r = g_orig.NewStringUTF(e, s); j.ret_raw(fv((jobject)r)); return r;
 }
 static const char* JNICALL h_GetStringUTFChars(JNIEnv* e, jstring s, jboolean* c) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.GetStringUTFChars(e, s, c);
-    J j(e, "GetStringUTFChars", RET_ADDR()); j.p("string", (jobject)s); j.flush();
+    J j(e, "GetStringUTFChars", RET_ADDR()); j.flush();
     const char* r = g_orig.GetStringUTFChars(e, s, c);
-    if (j.on) j.ret_raw(g_orig.ExceptionCheck(e) ? "" : "{\"pointer\":" + hexp(r) + ",\"text\":" + jstr(r) + "}");
+    if (j.on) j.ret_raw(g_orig.ExceptionCheck(e) ? "" : jstr(r));
     return r;
 }
 static jint JNICALL h_RegisterNatives(JNIEnv* e, jclass c, const JNINativeMethod* m, jint n) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.RegisterNatives(e, c, m, n);
     J j(e, "RegisterNatives", RET_ADDR());
     if (j.on) {
         j.s("class", sig_of_class(c).c_str());
@@ -515,23 +440,20 @@ static jint JNICALL h_RegisterNatives(JNIEnv* e, jclass c, const JNINativeMethod
         }
         j.raw("methods", a + "]");
     }
-    j.flush(); jint r = g_orig.RegisterNatives(e, c, m, n); if (j.on) j.ret_raw(fv(r)); return r;
+    j.flush(); jint r = g_orig.RegisterNatives(e, c, m, n); j.ret_raw(fv(r)); return r;
 }
 static jint JNICALL h_ThrowNew(JNIEnv* e, jclass c, const char* msg) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.ThrowNew(e, c, msg);
-    J j(e, "ThrowNew", RET_ADDR()); if (j.on) j.s("class", sig_of_class(c).c_str()); j.s("msg", msg); j.flush();
-    jint r = g_orig.ThrowNew(e, c, msg); if (j.on) j.ret_raw(fv(r)); return r;
+    J j(e, "ThrowNew", RET_ADDR()); j.s("class", sig_of_class(c).c_str()); j.s("msg", msg); j.flush();
+    jint r = g_orig.ThrowNew(e, c, msg); j.ret_raw(fv(r)); return r;
 }
 static jint JNICALL h_Throw(JNIEnv* e, jthrowable t) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.Throw(e, t);
-    J j(e, "Throw", RET_ADDR()); j.p("obj", t); j.flush(); jint r = g_orig.Throw(e, t); if (j.on) j.ret_raw(fv(r)); return r;
+    J j(e, "Throw", RET_ADDR()); j.p("obj", t); j.flush(); jint r = g_orig.Throw(e, t); j.ret_raw(fv(r)); return r;
 }
 
 // ---------------------------------------------------------------- Call*Method families
 // instance: (env,obj,mid,...)  static: (env,cls,mid,...)  nonvirtual: (env,obj,cls,mid,...)
 #define CALL_FAMILY(T, R, KIND, KINDNAME, CT)                                                       \
-static R JNICALL h_Call##KIND##T##Method(JNIEnv* e, CT o, jmethodID m, ...) { \
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) { va_list bypass; va_start(bypass, m); VaEnd cleanup{bypass}; return g_orig.Call##KIND##T##MethodV(e, o, m, bypass); }                    \
+static R JNICALL h_Call##KIND##T##Method(JNIEnv* e, CT o, jmethodID m, ...) {                    \
     J j(e, "Call" KINDNAME #T "Method", RET_ADDR()); MInfo mi;                                           \
     va_list ap; va_start(ap, m);                                                                      \
     if (j.on) { mi = minfo(m); j.s("class", mi.cls.c_str()); j.s("name", mi.name.c_str());            \
@@ -539,16 +461,14 @@ static R JNICALL h_Call##KIND##T##Method(JNIEnv* e, CT o, jmethodID m, ...) { \
     j.flush();                                                                                        \
     VaEnd ve{ap}; return do_call<R>(j, e, mi, [&]{ return g_orig.Call##KIND##T##MethodV(e, o, m, ap); });  \
 }                                                                                                     \
-static R JNICALL h_Call##KIND##T##MethodV(JNIEnv* e, CT o, jmethodID m, va_list ap) { \
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.Call##KIND##T##MethodV(e, o, m, ap);            \
+static R JNICALL h_Call##KIND##T##MethodV(JNIEnv* e, CT o, jmethodID m, va_list ap) {            \
     J j(e, "Call" KINDNAME #T "MethodV", RET_ADDR()); MInfo mi;                                          \
     if (j.on) { mi = minfo(m); j.s("class", mi.cls.c_str()); j.s("name", mi.name.c_str());            \
         j.s("sig", mi.sig.c_str()); j.raw("args", args_va(e, mi.sig, ap)); j.p("obj", o); }           \
     j.flush();                                                                                        \
     return do_call<R>(j, e, mi, [&]{ return g_orig.Call##KIND##T##MethodV(e, o, m, ap); });  \
 }                                                                                                     \
-static R JNICALL h_Call##KIND##T##MethodA(JNIEnv* e, CT o, jmethodID m, const jvalue* a) { \
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.Call##KIND##T##MethodA(e, o, m, a);       \
+static R JNICALL h_Call##KIND##T##MethodA(JNIEnv* e, CT o, jmethodID m, const jvalue* a) {       \
     J j(e, "Call" KINDNAME #T "MethodA", RET_ADDR()); MInfo mi;                                          \
     if (j.on) { mi = minfo(m); j.s("class", mi.cls.c_str()); j.s("name", mi.name.c_str());            \
         j.s("sig", mi.sig.c_str()); j.raw("args", args_a(e, mi.sig, a)); j.p("obj", o); }             \
@@ -557,8 +477,7 @@ static R JNICALL h_Call##KIND##T##MethodA(JNIEnv* e, CT o, jmethodID m, const jv
 }
 
 #define CALL_FAMILY_NV(T, R)                                                                          \
-static R JNICALL h_CallNonvirtual##T##Method(JNIEnv* e, jobject o, jclass c, jmethodID m, ...) { \
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) { va_list bypass; va_start(bypass, m); VaEnd cleanup{bypass}; return g_orig.CallNonvirtual##T##MethodV(e, o, c, m, bypass); }      \
+static R JNICALL h_CallNonvirtual##T##Method(JNIEnv* e, jobject o, jclass c, jmethodID m, ...) {      \
     J j(e, "CallNonvirtual" #T "Method", RET_ADDR()); MInfo mi;                                          \
     va_list ap; va_start(ap, m);                                                                      \
     if (j.on) { mi = minfo(m); j.s("class", mi.cls.c_str()); j.s("name", mi.name.c_str());            \
@@ -567,7 +486,6 @@ static R JNICALL h_CallNonvirtual##T##Method(JNIEnv* e, jobject o, jclass c, jme
     VaEnd ve{ap}; return do_call<R>(j, e, mi, [&]{ return g_orig.CallNonvirtual##T##MethodV(e, o, c, m, ap); });  \
 }                                                                                                     \
 static R JNICALL h_CallNonvirtual##T##MethodV(JNIEnv* e, jobject o, jclass c, jmethodID m, va_list ap) { \
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.CallNonvirtual##T##MethodV(e, o, c, m, ap); \
     J j(e, "CallNonvirtual" #T "MethodV", RET_ADDR()); MInfo mi;                                         \
     if (j.on) { mi = minfo(m); j.s("class", mi.cls.c_str()); j.s("name", mi.name.c_str());            \
         j.s("sig", mi.sig.c_str()); j.raw("args", args_va(e, mi.sig, ap)); j.p("obj", o); }           \
@@ -575,7 +493,6 @@ static R JNICALL h_CallNonvirtual##T##MethodV(JNIEnv* e, jobject o, jclass c, jm
     return do_call<R>(j, e, mi, [&]{ return g_orig.CallNonvirtual##T##MethodV(e, o, c, m, ap); });  \
 }                                                                                                     \
 static R JNICALL h_CallNonvirtual##T##MethodA(JNIEnv* e, jobject o, jclass c, jmethodID m, const jvalue* a) { \
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.CallNonvirtual##T##MethodA(e, o, c, m, a); \
     J j(e, "CallNonvirtual" #T "MethodA", RET_ADDR()); MInfo mi;                                         \
     if (j.on) { mi = minfo(m); j.s("class", mi.cls.c_str()); j.s("name", mi.name.c_str());            \
         j.s("sig", mi.sig.c_str()); j.raw("args", args_a(e, mi.sig, a)); j.p("obj", o); }             \
@@ -593,50 +510,43 @@ ALL_TYPES(CALL_FAMILY_NV)
 
 // NewObject family: (env, cls, mid, ...)
 static jobject JNICALL h_NewObject(JNIEnv* e, jclass c, jmethodID m, ...) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) { va_list bypass; va_start(bypass, m); VaEnd cleanup{bypass}; return g_orig.NewObjectV(e, c, m, bypass); }
     J j(e, "NewObject", RET_ADDR()); MInfo mi; va_list ap; va_start(ap, m);
     if (j.on) { mi = minfo(m); j.s("class", mi.cls.c_str()); j.s("sig", mi.sig.c_str()); j.raw("args", args_va(e, mi.sig, ap)); }
-    j.flush(); jobject r = g_orig.NewObjectV(e, c, m, ap); va_end(ap); if (j.on) j.ret_raw(fv(r)); return r;
+    j.flush(); jobject r = g_orig.NewObjectV(e, c, m, ap); va_end(ap); j.ret_raw(fv(r)); return r;
 }
 static jobject JNICALL h_NewObjectV(JNIEnv* e, jclass c, jmethodID m, va_list ap) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.NewObjectV(e, c, m, ap);
     J j(e, "NewObjectV", RET_ADDR()); MInfo mi;
     if (j.on) { mi = minfo(m); j.s("class", mi.cls.c_str()); j.s("sig", mi.sig.c_str()); j.raw("args", args_va(e, mi.sig, ap)); }
-    j.flush(); jobject r = g_orig.NewObjectV(e, c, m, ap); if (j.on) j.ret_raw(fv(r)); return r;
+    j.flush(); jobject r = g_orig.NewObjectV(e, c, m, ap); j.ret_raw(fv(r)); return r;
 }
 static jobject JNICALL h_NewObjectA(JNIEnv* e, jclass c, jmethodID m, const jvalue* a) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.NewObjectA(e, c, m, a);
     J j(e, "NewObjectA", RET_ADDR()); MInfo mi;
     if (j.on) { mi = minfo(m); j.s("class", mi.cls.c_str()); j.s("sig", mi.sig.c_str()); j.raw("args", args_a(e, mi.sig, a)); }
-    j.flush(); jobject r = g_orig.NewObjectA(e, c, m, a); if (j.on) j.ret_raw(fv(r)); return r;
+    j.flush(); jobject r = g_orig.NewObjectA(e, c, m, a); j.ret_raw(fv(r)); return r;
 }
 
 // ---------------------------------------------------------------- field accessors
 #define FIELD_HOOKS(T, R)                                                                             \
-static R JNICALL h_Get##T##Field(JNIEnv* e, jobject o, jfieldID f) { \
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.Get##T##Field(e, o, f);                                  \
+static R JNICALL h_Get##T##Field(JNIEnv* e, jobject o, jfieldID f) {                                  \
     J j(e, "Get" #T "Field", RET_ADDR()); MInfo fi;                                                      \
-    if (j.on) { fi = finfo(f); j.s("sig", fi.sig.c_str()); j.s("class", fi.cls.c_str()); j.s("name", fi.name.c_str()); j.p("field", (void*)f); j.p("obj", o); } \
+    if (j.on) { fi = finfo(f); j.s("class", fi.cls.c_str()); j.s("name", fi.name.c_str()); j.p("obj", o); } \
     j.flush(); R r = g_orig.Get##T##Field(e, o, f); if (j.on) log_ret(j, e, fi, r); return r;         \
 }                                                                                                     \
-static void JNICALL h_Set##T##Field(JNIEnv* e, jobject o, jfieldID f, R v) { \
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.Set##T##Field(e, o, f, v);                          \
+static void JNICALL h_Set##T##Field(JNIEnv* e, jobject o, jfieldID f, R v) {                          \
     J j(e, "Set" #T "Field", RET_ADDR());                                                                \
-    if (j.on) { MInfo fi = finfo(f); j.s("class", fi.cls.c_str()); j.s("name", fi.name.c_str()); j.p("field", (void*)f);      \
+    if (j.on) { MInfo fi = finfo(f); j.s("class", fi.cls.c_str()); j.s("name", fi.name.c_str());      \
         j.s("sig", fi.sig.c_str()); j.p("obj", o);                                                    \
         j.raw("val", fval<R>(e, v, fi.sig.c_str())); } \
     j.flush(); g_orig.Set##T##Field(e, o, f, v);                                                      \
 }                                                                                                     \
-static R JNICALL h_GetStatic##T##Field(JNIEnv* e, jclass c, jfieldID f) { \
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.GetStatic##T##Field(e, c, f);                             \
+static R JNICALL h_GetStatic##T##Field(JNIEnv* e, jclass c, jfieldID f) {                             \
     J j(e, "GetStatic" #T "Field", RET_ADDR()); MInfo fi;                                                \
-    if (j.on) { fi = finfo(f); j.s("sig", fi.sig.c_str()); j.s("class", fi.cls.c_str()); j.s("name", fi.name.c_str()); j.p("field", (void*)f); }          \
+    if (j.on) { fi = finfo(f); j.s("class", fi.cls.c_str()); j.s("name", fi.name.c_str()); }          \
     j.flush(); R r = g_orig.GetStatic##T##Field(e, c, f); if (j.on) log_ret(j, e, fi, r); return r;   \
 }                                                                                                     \
-static void JNICALL h_SetStatic##T##Field(JNIEnv* e, jclass c, jfieldID f, R v) { \
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.SetStatic##T##Field(e, c, f, v);                     \
+static void JNICALL h_SetStatic##T##Field(JNIEnv* e, jclass c, jfieldID f, R v) {                     \
     J j(e, "SetStatic" #T "Field", RET_ADDR());                                                          \
-    if (j.on) { MInfo fi = finfo(f); j.s("class", fi.cls.c_str()); j.s("name", fi.name.c_str()); j.p("field", (void*)f);      \
+    if (j.on) { MInfo fi = finfo(f); j.s("class", fi.cls.c_str()); j.s("name", fi.name.c_str());      \
         j.s("sig", fi.sig.c_str());                                                                   \
         j.raw("val", fval<R>(e, v, fi.sig.c_str())); } \
     j.flush(); g_orig.SetStatic##T##Field(e, c, f, v);                                                \
@@ -648,25 +558,20 @@ FIELD_TYPES(FIELD_HOOKS)
 
 // ---------------------------------------------------------------- object arrays (string tables!)
 static jobject JNICALL h_GetObjectArrayElement(JNIEnv* e, jobjectArray a, jsize i) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.GetObjectArrayElement(e, a, i);
     J j(e, "GetObjectArrayElement", RET_ADDR()); j.p("array", a); j.n("index", i); j.flush();
     jobject r = g_orig.GetObjectArrayElement(e, a, i);
     if (j.on) j.ret_raw(fvo(e, r, "Ljava/lang/Object;"));
     return r;
 }
 static void JNICALL h_SetObjectArrayElement(JNIEnv* e, jobjectArray a, jsize i, jobject v) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.SetObjectArrayElement(e, a, i, v);
     J j(e, "SetObjectArrayElement", RET_ADDR()); j.p("array", a); j.n("index", i);
     if (j.on) j.raw("val", fvo(e, v, "Ljava/lang/Object;"));
     j.flush(); g_orig.SetObjectArrayElement(e, a, i, v);
 }
 static jobjectArray JNICALL h_NewObjectArray(JNIEnv* e, jsize n, jclass c, jobject init) {
-    if (g_callback || g_thread_ended || !g_active.load(std::memory_order_acquire)) return g_orig.NewObjectArray(e, n, c, init);
-    J j(e, "NewObjectArray", RET_ADDR()); j.n("len", n); j.p("initial", init); if (j.on) j.s("elem", sig_of_class(c).c_str()); j.flush();
-    jobjectArray r = g_orig.NewObjectArray(e, n, c, init); if (j.on) j.ret_raw(fv((jobject)r)); return r;
+    J j(e, "NewObjectArray", RET_ADDR()); j.n("len", n); j.s("elem", sig_of_class(c).c_str()); j.flush();
+    jobjectArray r = g_orig.NewObjectArray(e, n, c, init); if (j.on) j.ret_raw(hexp(r)); return r;
 }
-
-#include "reconstruction_hooks.inc"
 
 // ---------------------------------------------------------------- install
 #define SET(name) g_new.name = h_##name
@@ -682,7 +587,7 @@ extern "C" JNIEXPORT jboolean JNICALL
 Java_jnitrace_Natives_init(JNIEnv* env, jclass, jstring jpath, jstring jfilter, jstring jdump, jboolean unknown, jstring jclasses, jint depth, jboolean compact, jboolean flushEach) {
     if (g_f) return g_active.load() ? JNI_TRUE : JNI_FALSE;
     JavaVM* vm = nullptr; env->GetJavaVM(&vm); g_vm = vm;
-    if (!g_jvmti && (vm->GetEnv((void**)&g_jvmti, JVMTI_VERSION_1_2) != JNI_OK || !g_jvmti)) return JNI_FALSE;
+    if (vm->GetEnv((void**)&g_jvmti, JVMTI_VERSION_1_2) != JNI_OK || !g_jvmti) return JNI_FALSE;
 
     const char* p = env->GetStringUTFChars(jpath, nullptr);
     g_f = fopen(p, "wb"); env->ReleaseStringUTFChars(jpath, p);
@@ -716,15 +621,9 @@ Java_jnitrace_Natives_init(JNIEnv* env, jclass, jstring jpath, jstring jfilter, 
     SET(GetObjectArrayElement); SET(SetObjectArrayElement); SET(NewObjectArray);
     ALL_TYPES(SET_CALLS)
     FIELD_TYPES(SET_FIELDS)
-    install_extra_hooks();
-    configure_live_events();
 
     g_active.store(true, std::memory_order_release);
-    if (g_jvmti->SetJNIFunctionTable(&g_new) == JVMTI_ERROR_NONE) {
-        emit_session();
-        enable_boundaries();
-        return JNI_TRUE;
-    }
+    if (g_jvmti->SetJNIFunctionTable(&g_new) == JVMTI_ERROR_NONE) return JNI_TRUE;
     g_active.store(false, std::memory_order_release);
     fclose(g_f); g_f = nullptr;
     return JNI_FALSE;
@@ -735,5 +634,3 @@ extern "C" JNIEXPORT void JNICALL Java_jnitrace_Natives_shutdown(JNIEnv*, jclass
     std::lock_guard<std::mutex> g(g_mu);
     if (g_f) { fflush(g_f); }   // keep hooks alive; file closed by process exit
 }
-
-#include "startup_agent.inc"

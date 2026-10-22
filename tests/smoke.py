@@ -3,7 +3,7 @@ import json
 import pathlib
 import subprocess
 import sys
-import contextlib
+import tempfile
 
 root = pathlib.Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("expand_trace", root / "scripts/expand_trace.py")
@@ -20,28 +20,11 @@ jar = root / "target/jnitrace.jar"
 lib = (root / "target" / ("fixture.dll" if sys.platform == "win32" else "libfixture.so")).resolve()
 subprocess.run(["javac", "-d", str(root / "target/test-classes"), str(root / "tests/Fixture.java")], check=True)
 sizes = {}
-# Keep traces and JVM crash reports when the subprocess dies. A temporary
-# directory would delete the only evidence before Actions can upload it.
-trace_root = root / "target/smoke-traces"
-trace_root.mkdir(parents=True, exist_ok=True)
-
-def run_java(command):
-    report = trace_root / "hs_err_pid%p.log"
-    command = [command[0], f"-XX:ErrorFile={report}", *command[1:]]
-    result = subprocess.run(command, check=False, capture_output=True, text=True, errors="replace")
-    (trace_root / "java-stdout.log").write_text(result.stdout, encoding="utf-8")
-    (trace_root / "java-stderr.log").write_text(result.stderr, encoding="utf-8")
-    print(result.stdout, end="")
-    print(result.stderr, end="", file=sys.stderr)
-    if result.returncode:
-        code = result.returncode & 0xffffffff
-        raise RuntimeError(f"Java exited with {result.returncode} (0x{code:08X}); diagnostics: {trace_root}")
-
-with contextlib.nullcontext(str(trace_root)) as tmp:
+with tempfile.TemporaryDirectory() as tmp:
     for compact in (0, 1):
         out = pathlib.Path(tmp) / str(compact)
-        options = f"module=fixture,include=obf.*;native.*,out={out},compact={compact},flush=1"
-        run_java(["java", f"-javaagent:{jar}={options}", "-cp", str(root / "target/test-classes"), "obf.Fixture", str(lib)])
+        options = f"module=fixture,include=obf.*;native.*,out={out},compact={compact}"
+        subprocess.run(["java", f"-javaagent:{jar}={options}", "-cp", str(root / "target/test-classes"), "obf.Fixture", str(lib)], check=True)
         trace = out / "jni_trace.jsonl"
         sizes[compact] = trace.stat().st_size
         raw = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
@@ -49,18 +32,26 @@ with contextlib.nullcontext(str(trace_root)) as tmp:
         assert raw, "No trace produced (check native initialization stderr)"
         enters = {x["seq"]: x for x in records if x["ev"] == "enter"}
         exits = {x["seq"]: x for x in records if x["ev"] == "exit"}
-        assert len(enters) == 5600, len(enters)
+        assert len(enters) == 3200, len(enters)
         assert enters.keys() == exits.keys()
-        assert all(x.get("schema") == 2 for x in enters.values())
+        for record in enters.values():
+            assert record["mod"].lower().endswith(("fixture.dll", "libfixture.so"))
+            va = int(record["va"], 16)
+            rva = int(record["rva"], 16)
+            base = int(record["dll_base"], 16)
+            assert base > 0 and va >= base
+            assert base == va - rva, record
+        assert len({x["dll_base"] for x in enters.values()}) == 1
+        assert len(records) == 2 * len(enters)
         assert len({x["tid"] for x in enters.values()}) == 2
         assert all(x["in"].startswith("obf.Fixture.") for x in enters.values())
-        assert any(isinstance(x.get("val"), dict) and x["val"].get("text") == "A\x00中😀" for x in exits.values())
+        assert any(x.get("val") == "A\x00中😀" for x in exits.values())
         assert sum(bool(x.get("exception")) for x in exits.values()) == 400
         assert not (out / "jni_trace.json").exists()
         assert any(x.get("ev") == "context" for x in raw) == bool(compact)
-    # Filter rejection should produce no JNI operations (session metadata remains).
+    # Filter rejection should create an empty trace.
     out = pathlib.Path(tmp) / "reject"
-    run_java(["java", f"-javaagent:{jar}=module=fixture,include=does.not.match.*,out={out},flush=1", "-cp", str(root / "target/test-classes"), "obf.Fixture", str(lib)])
-    assert not any(x.get("ev") == "enter" for x in map(json.loads, (out / "jni_trace.jsonl").read_text().splitlines()))
+    subprocess.run(["java", f"-javaagent:{jar}=module=fixture,include=does.not.match.*,out={out}", "-cp", str(root / "target/test-classes"), "obf.Fixture", str(lib)], check=True)
+    assert (out / "jni_trace.jsonl").read_bytes() == b""
 assert sizes[1] < sizes[0], sizes
 print(f"Smoke passed; plain={sizes[0]} compact={sizes[1]} bytes")
